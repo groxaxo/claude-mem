@@ -1,0 +1,4 @@
+# OpenCode generated files
+node_modules/
+package.json
+bun.lock

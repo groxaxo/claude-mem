@@ -21,6 +21,9 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
   const WORKER_HOST = process.env.CLAUDE_MEM_WORKER_HOST || "localhost";
   const WORKER_BASE_URL = `http://${WORKER_HOST}:${WORKER_PORT}`;
 
+  // Track sessions to inject context only once per session
+  const sessionsWithContext = new Set<string>();
+
   /**
    * Check if worker service is running
    */
@@ -105,12 +108,30 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
   return {
     /**
+     * Capture new messages to track session state
+     * This allows us to inject context at the right time
+     */
+    "chat.message": async (input, output) => {
+      const { sessionID } = input;
+      
+      // Track that we've seen this session
+      if (sessionID && !sessionsWithContext.has(sessionID)) {
+        sessionsWithContext.add(sessionID);
+        console.log(`[claude-mem] New session started: ${sessionID}`);
+      }
+    },
+
+    /**
      * Inject memory context into system prompts
      * This hook modifies the system prompt to include relevant memory context
      */
     "experimental.chat.system.transform": async (input, output) => {
-      // Only inject context if we have a valid session
-      const sessionID = crypto.randomUUID(); // OpenCode should provide this
+      // Since this hook doesn't get sessionID, we'll inject context for all sessions
+      // The context API will handle deduplication on the server side
+      
+      // Use a session identifier based on the working directory
+      // This is a workaround until we can track the actual session ID
+      const sessionID = `opencode-${directory}`;
       
       const memoryContext = await getMemoryContext(sessionID);
       
@@ -120,6 +141,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           "The following context is retrieved from previous sessions:\n\n" +
           memoryContext.join("\n\n")
         );
+        console.log(`[claude-mem] Injected ${memoryContext.length} context items`);
       }
     },
 
@@ -141,8 +163,21 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
           ...metadata,
           title,
           timestamp: new Date().toISOString(),
+          directory,
+          project: project.name,
         },
       });
+    },
+
+    /**
+     * Capture tool execution arguments before execution
+     * This gives us access to the actual arguments
+     */
+    "tool.execute.before": async (input, output) => {
+      // We could use this to capture arguments if needed
+      // For now, we just track it
+      const { tool, sessionID, callID } = input;
+      console.log(`[claude-mem] Tool executing: ${tool} (session: ${sessionID})`);
     },
 
     /**
@@ -152,6 +187,16 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       // Could customize claude-mem behavior based on OpenCode config
       if (config.instructions) {
         console.log("[claude-mem] Loaded with instructions from:", config.instructions);
+      }
+    },
+
+    /**
+     * Handle global events for debugging
+     */
+    event: async ({ event }) => {
+      // Log events for debugging
+      if (event.type === "session.start") {
+        console.log("[claude-mem] Session started event");
       }
     },
   };
