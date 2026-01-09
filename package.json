@@ -1,10 +1,11 @@
 {
   "name": "claude-mem",
   "version": "9.0.1",
-  "description": "Memory compression system for Claude Code - persist context across sessions",
+  "description": "Memory compression system for Claude Code and OpenCode - persist context across sessions",
   "keywords": [
     "claude",
     "claude-code",
+    "opencode",
     "claude-agent-sdk",
     "mcp",
     "plugin",
