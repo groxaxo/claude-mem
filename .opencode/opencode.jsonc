@@ -1,0 +1,36 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  
+  // Claude-Mem OpenCode Configuration
+  // This configuration enables persistent memory across coding sessions
+  
+  // Instructions to add to system prompts
+  "instructions": [
+    ".opencode/instructions/claude-mem.md"
+  ],
+  
+  // MCP server integration for memory search tools
+  "mcp": {
+    "claude-mem-search": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["plugin/scripts/mcp-server.cjs"],
+      "description": "Claude-Mem search tools for querying past coding sessions"
+    }
+  },
+  
+  // Plugin configuration
+  // Note: The plugin is automatically loaded from .opencode/plugin/claude-mem.ts
+  
+  // Provider configuration (optional - customize as needed)
+  // "provider": {
+  //   "opencode": {
+  //     "options": {}
+  //   }
+  // },
+  
+  // Tool permissions (optional)
+  // "tools": {
+  //   // Allow all tools by default
+  // }
+}

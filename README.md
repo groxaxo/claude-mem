@@ -43,7 +43,7 @@
   <a href="docs/i18n/README.no.md">🇳🇴 Norsk</a>
 </p>
 
-<h4 align="center">Persistent memory compression system built for <a href="https://claude.com/claude-code" target="_blank">Claude Code</a>.</h4>
+<h4 align="center">Persistent memory compression system built for <a href="https://claude.com/claude-code" target="_blank">Claude Code</a> and <a href="https://github.com/anomalyco/opencode" target="_blank">OpenCode</a>.</h4>
 
 <p align="center">
   <a href="LICENSE">
@@ -98,6 +98,8 @@
 
 ## Quick Start
 
+### For Claude Code
+
 Start a new Claude Code session in the terminal and enter the following commands:
 
 ```
@@ -107,6 +109,37 @@ Start a new Claude Code session in the terminal and enter the following commands
 ```
 
 Restart Claude Code. Context from previous sessions will automatically appear in new sessions.
+
+### For OpenCode
+
+Claude-Mem is fully compatible with [OpenCode](https://github.com/anomalyco/opencode), the open-source AI coding agent.
+
+1. **Install and build claude-mem**:
+   ```bash
+   git clone https://github.com/thedotmack/claude-mem.git
+   cd claude-mem
+   npm install
+   npm run build
+   npm run worker:start
+   ```
+
+2. **Add to your OpenCode project**:
+   
+   Copy the `.opencode` directory to your project or add to your `opencode.jsonc`:
+   ```json
+   {
+     "plugin": ["file:///path/to/claude-mem/.opencode/plugin/claude-mem.ts"],
+     "mcp": {
+       "claude-mem-search": {
+         "type": "stdio",
+         "command": "node",
+         "args": ["/path/to/claude-mem/plugin/scripts/mcp-server.cjs"]
+       }
+     }
+   }
+   ```
+
+See [.opencode/README.md](.opencode/README.md) for detailed OpenCode setup instructions.
 
 **Key Features:**
 
