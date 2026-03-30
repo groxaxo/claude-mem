@@ -1,206 +1,299 @@
 /**
  * Claude-Mem OpenCode Plugin
- * 
- * This plugin integrates claude-mem's persistent memory system with OpenCode.
- * It provides memory compression and context retrieval across coding sessions.
- * 
- * Features:
- * - Automatic session observation capture
- * - Semantic memory compression
- * - Context injection at session start
- * - Search tools via MCP integration
+ *
+ * Integrates claude-mem's persistent memory system with OpenCode.
+ * Captures tool usage, compresses observations into semantic summaries,
+ * and injects relevant context at the start of each session.
+ *
+ * Worker API endpoints used:
+ *   GET  /api/context/inject?projects=<name>  – Fetch pre-formatted context
+ *   POST /api/sessions/init                   – Init session + save user prompt
+ *   POST /sessions/:id/init                   – Start the background SDK agent
+ *   POST /api/sessions/observations           – Save tool observations
+ *   POST /api/sessions/summarize              – Trigger end-of-session summary
+ *   GET  /api/readiness                       – Check if worker is fully ready
+ *
+ * Lifecycle hooks used:
+ *   experimental.chat.system.transform – Inject memory context into system prompt
+ *   chat.message                       – Initialize session on first user message
+ *   tool.execute.after                 – Capture every tool execution
+ *   experimental.session.compacting    – Trigger summary before compaction
  */
 
 import type { Plugin } from "@opencode-ai/plugin";
+import { join, basename } from "path";
+import { homedir } from "os";
+import { existsSync } from "fs";
 
 export const ClaudeMemPlugin: Plugin = async (ctx) => {
-  const { client, project, directory, worktree, serverUrl, $ } = ctx;
+  const { directory, project, $ } = ctx;
 
-  // Worker service configuration
+  // ---------------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------------
   const WORKER_PORT = process.env.CLAUDE_MEM_WORKER_PORT || "37777";
-  const WORKER_HOST = process.env.CLAUDE_MEM_WORKER_HOST || "localhost";
+  const WORKER_HOST = process.env.CLAUDE_MEM_WORKER_HOST || "127.0.0.1";
   const WORKER_BASE_URL = `http://${WORKER_HOST}:${WORKER_PORT}`;
 
-  // Track sessions to inject context only once per session
-  const sessionsWithContext = new Set<string>();
+  // Project name extracted from the working directory (e.g. "my-project")
+  const projectName = basename(directory);
 
-  /**
-   * Check if worker service is running
-   */
-  async function isWorkerRunning(): Promise<boolean> {
+  // Session state: tracks which OpenCode sessions have been initialized
+  const initializedSessions = new Set<string>();
+
+  // ---------------------------------------------------------------------------
+  // Worker helpers
+  // ---------------------------------------------------------------------------
+
+  /** Returns true when the worker service is up and fully ready */
+  async function isWorkerReady(): Promise<boolean> {
     try {
-      const response = await fetch(`${WORKER_BASE_URL}/health`, {
-        signal: AbortSignal.timeout(1000),
+      const res = await fetch(`${WORKER_BASE_URL}/api/readiness`, {
+        signal: AbortSignal.timeout(2000),
       });
-      return response.ok;
+      return res.ok;
     } catch {
       return false;
     }
   }
 
   /**
-   * Start worker service if not running
+   * Resolve the absolute path to worker-service.cjs.
+   *
+   * Search order:
+   *   1. CLAUDE_MEM_INSTALL_DIR env var
+   *   2. Two directories above this plugin file (claude-mem repo layout)
+   *   3. Claude Code marketplace install: ~/.claude/plugins/marketplaces/thedotmack
    */
+  function resolveWorkerScript(): string | null {
+    const candidates: string[] = [];
+
+    if (process.env.CLAUDE_MEM_INSTALL_DIR) {
+      candidates.push(
+        join(process.env.CLAUDE_MEM_INSTALL_DIR, "plugin", "scripts", "worker-service.cjs"),
+      );
+    }
+
+    // .opencode/plugin/claude-mem.ts → two levels up is the claude-mem root
+    try {
+      const pluginDir = join(directory, ".opencode", "plugin");
+      candidates.push(join(pluginDir, "..", "..", "plugin", "scripts", "worker-service.cjs"));
+    } catch {
+      // ignore
+    }
+
+    // Claude Code marketplace path
+    candidates.push(
+      join(homedir(), ".claude", "plugins", "marketplaces", "thedotmack", "scripts", "worker-service.cjs"),
+    );
+
+    for (const p of candidates) {
+      if (existsSync(p)) return p;
+    }
+    return null;
+  }
+
+  /** Start the claude-mem worker service if it is not yet running */
   async function ensureWorkerRunning(): Promise<void> {
-    const running = await isWorkerRunning();
-    if (!running) {
-      console.log("[claude-mem] Starting worker service...");
-      // Try to start the worker using the installed service
-      try {
-        await $`bun plugin/scripts/worker-service.cjs start`.quiet();
-      } catch (error) {
-        console.warn("[claude-mem] Could not start worker service automatically:", error);
-        console.log("[claude-mem] Please start it manually: npm run worker:start");
-      }
+    if (await isWorkerReady()) return;
+
+    const workerScript = resolveWorkerScript();
+    if (!workerScript) {
+      console.warn(
+        "[claude-mem] Worker service is not running and could not be located.\n" +
+          "  Please start it manually: npm run worker:start\n" +
+          "  Or set CLAUDE_MEM_INSTALL_DIR to the claude-mem installation directory.",
+      );
+      return;
+    }
+
+    try {
+      await $`bun ${workerScript} start`.quiet();
+      // Allow the service a moment to initialise before checking readiness
+      const WORKER_STARTUP_DELAY_MS = 500;
+      await new Promise<void>((resolve) => setTimeout(resolve, WORKER_STARTUP_DELAY_MS));
+    } catch (err) {
+      console.warn("[claude-mem] Failed to start worker service:", err);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Memory helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Fetch pre-formatted memory context for the current project.
+   * Returns the context as a plain-text string, or "" on failure.
+   */
+  async function fetchMemoryContext(): Promise<string> {
+    try {
+      const url =
+        `${WORKER_BASE_URL}/api/context/inject` +
+        `?projects=${encodeURIComponent(projectName)}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) return "";
+      const text = await res.text();
+      return text.trim();
+    } catch {
+      return "";
     }
   }
 
   /**
-   * Get context from worker service
+   * Initialize a session in the worker database and start the background agent.
+   * Mirrors the two-step flow used by claude-mem's new-hook.ts.
    */
-  async function getMemoryContext(sessionID: string): Promise<string[]> {
+  async function initSession(sessionID: string, prompt: string): Promise<void> {
+    // Step 1: create / retrieve the DB session and save the user prompt
+    const initRes = await fetch(`${WORKER_BASE_URL}/api/sessions/init`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ contentSessionId: sessionID, project: projectName, prompt }),
+    });
+
+    if (!initRes.ok) {
+      console.warn(`[claude-mem] Session init failed: ${initRes.status}`);
+      return;
+    }
+
+    const { sessionDbId, promptNumber, skipped } = await initRes.json();
+
+    if (skipped) return; // entire prompt was inside <private> tags
+
+    // Step 2: start the background memory-agent for this session
+    await fetch(`${WORKER_BASE_URL}/sessions/${sessionDbId}/init`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userPrompt: prompt, promptNumber }),
+    }).catch(() => {
+      // Agent start is best-effort; observations will still be queued
+    });
+  }
+
+  /**
+   * Send a tool observation to the worker for storage and compression.
+   * Mirrors the flow used by claude-mem's save-hook.ts.
+   */
+  async function saveObservation(
+    sessionID: string,
+    toolName: string,
+    toolInput: unknown,
+    toolOutput: string,
+  ): Promise<void> {
     try {
-      const response = await fetch(`${WORKER_BASE_URL}/api/context`, {
+      await fetch(`${WORKER_BASE_URL}/api/sessions/observations`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sessionId: sessionID,
-          workingDirectory: directory,
+          contentSessionId: sessionID,
+          tool_name: toolName,
+          tool_input: toolInput,
+          tool_response: toolOutput,
+          cwd: directory,
         }),
       });
-
-      if (!response.ok) {
-        console.warn(`[claude-mem] Failed to fetch context: ${response.status}`);
-        return [];
-      }
-
-      const data = await response.json();
-      return data.context || [];
-    } catch (error) {
-      console.warn("[claude-mem] Error fetching memory context:", error);
-      return [];
+    } catch {
+      // Fire-and-forget; memory capture failures must not interrupt coding
     }
   }
 
   /**
-   * Save observation to memory
+   * Queue a summary request at the end of the session.
+   * Mirrors the flow used by claude-mem's summary-hook.ts.
    */
-  async function saveObservation(data: {
-    sessionId: string;
-    tool: string;
-    args: any;
-    output: string;
-    metadata?: any;
-  }): Promise<void> {
+  async function requestSummary(sessionID: string, lastAssistantMessage?: string): Promise<void> {
     try {
-      await fetch(`${WORKER_BASE_URL}/api/observation`, {
+      await fetch(`${WORKER_BASE_URL}/api/sessions/summarize`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify({
+          contentSessionId: sessionID,
+          last_assistant_message: lastAssistantMessage || "",
+        }),
       });
-    } catch (error) {
-      console.warn("[claude-mem] Error saving observation:", error);
+    } catch {
+      // Best-effort
     }
   }
 
-  // Ensure worker is running on plugin load
+  // ---------------------------------------------------------------------------
+  // Startup
+  // ---------------------------------------------------------------------------
   await ensureWorkerRunning();
 
+  // ---------------------------------------------------------------------------
+  // Plugin hooks
+  // ---------------------------------------------------------------------------
   return {
     /**
-     * Capture new messages to track session state
-     * This allows us to inject context at the right time
+     * Inject memory context into the system prompt.
+     * Called by OpenCode before each LLM request, equivalent to claude-mem's
+     * SessionStart / context-hook.
+     */
+    "experimental.chat.system.transform": async (_input, output) => {
+      const ctx = await fetchMemoryContext();
+      if (ctx) {
+        output.system.push("\n" + ctx);
+      }
+    },
+
+    /**
+     * Initialize the session when the first user message arrives.
+     * This is the OpenCode equivalent of claude-mem's UserPromptSubmit / new-hook.
+     *
+     * Extracts the prompt text from message parts, stores it in the worker DB,
+     * and starts the background memory agent.
      */
     "chat.message": async (input, output) => {
       const { sessionID } = input;
-      
-      // Track that we've seen this session
-      if (sessionID && !sessionsWithContext.has(sessionID)) {
-        sessionsWithContext.add(sessionID);
-        console.log(`[claude-mem] New session started: ${sessionID}`);
+      if (!sessionID || initializedSessions.has(sessionID)) return;
+      initializedSessions.add(sessionID);
+
+      // Extract user prompt text from message parts
+      let promptText = "";
+      for (const part of output.parts) {
+        if (part.type === "text") {
+          promptText += part.text;
+        }
       }
+      if (!promptText.trim()) return;
+
+      await initSession(sessionID, promptText.trim());
     },
 
     /**
-     * Inject memory context into system prompts
-     * This hook modifies the system prompt to include relevant memory context
-     */
-    "experimental.chat.system.transform": async (input, output) => {
-      // Since this hook doesn't get sessionID, we'll inject context for all sessions
-      // The context API will handle deduplication on the server side
-      
-      // Use a session identifier based on the working directory
-      // This is a workaround until we can track the actual session ID
-      const sessionID = `opencode-${directory}`;
-      
-      const memoryContext = await getMemoryContext(sessionID);
-      
-      if (memoryContext.length > 0) {
-        output.system.push(
-          "\n# Claude-Mem Context\n\n" +
-          "The following context is retrieved from previous sessions:\n\n" +
-          memoryContext.join("\n\n")
-        );
-        console.log(`[claude-mem] Injected ${memoryContext.length} context items`);
-      }
-    },
-
-    /**
-     * Capture tool executions for memory
-     * This hook runs after tool execution to save observations
+     * Capture every tool execution as an observation.
+     * This is the OpenCode equivalent of claude-mem's PostToolUse / save-hook.
+     *
+     * The `args` field is available in input since opencode ≥0.1.x.
      */
     "tool.execute.after": async (input, output) => {
-      const { tool, sessionID, callID } = input;
-      const { title, output: toolOutput, metadata } = output;
+      const { tool, sessionID, args } = input;
+      if (!sessionID) return;
 
-      // Save tool execution to memory
-      await saveObservation({
-        sessionId: sessionID,
-        tool,
-        args: { callID }, // OpenCode doesn't expose args in after hook
-        output: toolOutput,
-        metadata: {
-          ...metadata,
-          title,
-          timestamp: new Date().toISOString(),
-          directory,
-          project: project.name,
-        },
-      });
+      await saveObservation(sessionID, tool, args, output.output);
     },
 
     /**
-     * Capture tool execution arguments before execution
-     * This gives us access to the actual arguments
+     * Trigger session summary before compaction.
+     * This is the OpenCode equivalent of claude-mem's Stop / summary-hook.
+     *
+     * The hook receives the sessionID and can append context strings that
+     * will be included in the compaction prompt.
      */
-    "tool.execute.before": async (input, output) => {
-      // We could use this to capture arguments if needed
-      // For now, we just track it
-      const { tool, sessionID, callID } = input;
-      console.log(`[claude-mem] Tool executing: ${tool} (session: ${sessionID})`);
-    },
+    "experimental.session.compacting": async (input, output) => {
+      const { sessionID } = input;
+      if (!sessionID) return;
 
-    /**
-     * Handle configuration updates
-     */
-    config: async (config) => {
-      // Could customize claude-mem behavior based on OpenCode config
-      if (config.instructions) {
-        console.log("[claude-mem] Loaded with instructions from:", config.instructions);
-      }
-    },
+      await requestSummary(sessionID);
 
-    /**
-     * Handle global events for debugging
-     */
-    event: async ({ event }) => {
-      // Log events for debugging
-      if (event.type === "session.start") {
-        console.log("[claude-mem] Session started event");
-      }
+      // Optionally remind the compacted context about the memory system
+      output.context.push(
+        "This session's observations have been saved to claude-mem for future reference.",
+      );
     },
   };
 };
 
-// Export as default for OpenCode plugin loading
+// Export as default so OpenCode can load the plugin automatically
 export default ClaudeMemPlugin;
