@@ -48,9 +48,10 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
   /** Returns true when the worker service is up and fully ready */
   async function isWorkerReady(): Promise<boolean> {
     try {
-      const res = await fetch(`${WORKER_BASE_URL}/api/readiness`, {
-        signal: AbortSignal.timeout(2000),
-      });
+      // Note: no AbortSignal – avoids the Windows Bun cleanup issue (libuv assertion)
+      // documented in src/shared/worker-utils.ts. A refused connection throws, which
+      // is caught below and treated as "not ready".
+      const res = await fetch(`${WORKER_BASE_URL}/api/readiness`);
       return res.ok;
     } catch {
       return false;
@@ -130,7 +131,22 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       const url =
         `${WORKER_BASE_URL}/api/context/inject` +
         `?projects=${encodeURIComponent(projectName)}`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      // Use Promise.race for timeout instead of AbortSignal to avoid the Windows
+      // Bun cleanup issue (libuv assertion) documented in src/shared/worker-utils.ts.
+      const CONTEXT_FETCH_TIMEOUT_MS = 5000;
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      const res = await (Promise.race([
+        fetch(url).then((r) => {
+          clearTimeout(timeoutHandle);
+          return r;
+        }),
+        new Promise<Response>((_, reject) => {
+          timeoutHandle = setTimeout(
+            () => reject(new Error("fetchMemoryContext timeout")),
+            CONTEXT_FETCH_TIMEOUT_MS,
+          );
+        }),
+      ]) as Promise<Response>);
       if (!res.ok) return "";
       const text = await res.text();
       return text.trim();
@@ -142,32 +158,38 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
   /**
    * Initialize a session in the worker database and start the background agent.
    * Mirrors the two-step flow used by claude-mem's new-hook.ts.
+   * Wrapped in try/catch so any network or parse failure is silently swallowed
+   * and never disrupts OpenCode's hook pipeline.
    */
   async function initSession(sessionID: string, prompt: string): Promise<void> {
-    // Step 1: create / retrieve the DB session and save the user prompt
-    const initRes = await fetch(`${WORKER_BASE_URL}/api/sessions/init`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ contentSessionId: sessionID, project: projectName, prompt }),
-    });
+    try {
+      // Step 1: create / retrieve the DB session and save the user prompt
+      const initRes = await fetch(`${WORKER_BASE_URL}/api/sessions/init`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ contentSessionId: sessionID, project: projectName, prompt }),
+      });
 
-    if (!initRes.ok) {
-      console.warn(`[claude-mem] Session init failed: ${initRes.status}`);
-      return;
+      if (!initRes.ok) {
+        console.warn(`[claude-mem] Session init failed: ${initRes.status}`);
+        return;
+      }
+
+      const { sessionDbId, promptNumber, skipped } = await initRes.json();
+
+      if (skipped) return; // entire prompt was inside <private> tags
+
+      // Step 2: start the background memory-agent for this session
+      await fetch(`${WORKER_BASE_URL}/sessions/${sessionDbId}/init`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ userPrompt: prompt, promptNumber }),
+      }).catch(() => {
+        // Agent start is best-effort; observations will still be queued
+      });
+    } catch {
+      // Fire-and-forget; session init failures must not interrupt coding
     }
-
-    const { sessionDbId, promptNumber, skipped } = await initRes.json();
-
-    if (skipped) return; // entire prompt was inside <private> tags
-
-    // Step 2: start the background memory-agent for this session
-    await fetch(`${WORKER_BASE_URL}/sessions/${sessionDbId}/init`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userPrompt: prompt, promptNumber }),
-    }).catch(() => {
-      // Agent start is best-effort; observations will still be queued
-    });
   }
 
   /**
@@ -243,13 +265,17 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
      *
      * Extracts the prompt text from message parts, stores it in the worker DB,
      * and starts the background memory agent.
+     *
+     * The session is only marked as initialized after we have confirmed there is
+     * non-empty text to send, so that messages with no text parts can be retried.
      */
     "chat.message": async (input, output) => {
       const { sessionID } = input;
       if (!sessionID || initializedSessions.has(sessionID)) return;
-      initializedSessions.add(sessionID);
 
-      // Extract user prompt text from message parts
+      // Extract user prompt text from message parts first.
+      // Only mark the session initialized after we have content – this allows
+      // the next message to retry if the first had no text parts.
       let promptText = "";
       for (const part of output.parts) {
         if (part.type === "text") {
@@ -258,6 +284,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
       }
       if (!promptText.trim()) return;
 
+      initializedSessions.add(sessionID);
       await initSession(sessionID, promptText.trim());
     },
 
