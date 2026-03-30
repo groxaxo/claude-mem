@@ -320,23 +320,5 @@ describe("OpenCode Plugin – API endpoint mapping", () => {
     expect(calls.filter((c) => c.url.includes("/summarize"))).toHaveLength(0);
     expect(compactionOutput.context).toHaveLength(0);
   });
-
-  it("resolveWorkerScript returns path when CLAUDE_MEM_INSTALL_DIR is set", () => {
-    // Test the path resolution logic directly
-    const installDir = "/fake/claude-mem";
-    const expected = join(installDir, "plugin", "scripts", "worker-service.cjs");
-
-    // Simulate the resolution logic
-    const candidates: string[] = [];
-    const savedEnv = process.env.CLAUDE_MEM_INSTALL_DIR;
-    process.env.CLAUDE_MEM_INSTALL_DIR = installDir;
-
-    if (process.env.CLAUDE_MEM_INSTALL_DIR) {
-      candidates.push(join(process.env.CLAUDE_MEM_INSTALL_DIR, "plugin", "scripts", "worker-service.cjs"));
-    }
-
-    process.env.CLAUDE_MEM_INSTALL_DIR = savedEnv ?? "";
-    expect(candidates[0]).toBe(expected);
-  });
 });
 
