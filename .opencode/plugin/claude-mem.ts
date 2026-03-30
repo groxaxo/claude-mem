@@ -84,7 +84,7 @@ export const ClaudeMemPlugin: Plugin = async (ctx) => {
 
     // Claude Code marketplace path
     candidates.push(
-      join(homedir(), ".claude", "plugins", "marketplaces", "thedotmack", "scripts", "worker-service.cjs"),
+      join(homedir(), ".claude", "plugins", "marketplaces", "thedotmack", "plugin", "scripts", "worker-service.cjs"),
     );
 
     for (const p of candidates) {
